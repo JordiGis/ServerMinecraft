@@ -1,0 +1,518 @@
+"""Panel web ligero para monitorizar el servidor Minecraft (itzg).
+
+Funciones:
+  - Estado del contenedor + jugadores online (via RCON `list`)
+  - Consola RCON (ejecutar comandos)
+  - Metricas CPU/RAM del contenedor (Docker API)
+  - Control start/stop/restart (Docker API)
+"""
+import os
+import functools
+import io
+import json
+import shutil
+import socket
+import struct
+import tempfile
+import urllib.request
+import urllib.parse
+import zipfile
+from pathlib import Path
+
+from flask import Flask, request, jsonify, Response, render_template
+from werkzeug.utils import secure_filename
+import docker
+
+RCON_HOST = os.environ.get("RCON_HOST", "mc")
+RCON_PORT = int(os.environ.get("RCON_PORT", "25575"))
+RCON_PASSWORD = os.environ.get("RCON_PASSWORD", "minecraft")
+MC_CONTAINER = os.environ.get("MC_CONTAINER", "minecraft")
+PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+MODS_DIR = Path(os.environ.get("MODS_DIR", "/data/mods"))
+CF_API_KEY = os.environ.get("CF_API_KEY", "")
+
+app = Flask(__name__)
+_docker = docker.from_env()
+
+
+# ---------------------------------------------------------------------------
+# RCON (protocolo Source RCON, implementacion minima)
+# ---------------------------------------------------------------------------
+class RconError(Exception):
+    pass
+
+
+class Rcon:
+    def __init__(self, host, port, password, timeout=5):
+        self.host, self.port, self.password, self.timeout = host, port, password, timeout
+        self.sock = None
+        self._id = 0
+
+    def __enter__(self):
+        self.sock = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock.settimeout(self.timeout)
+        if self._send(3, self.password) is None:
+            raise RconError("autenticacion RCON fallida")
+        return self
+
+    def __exit__(self, *a):
+        if self.sock:
+            self.sock.close()
+
+    def _send(self, ptype, body):
+        self._id += 1
+        req_id = self._id
+        payload = struct.pack("<ii", req_id, ptype) + body.encode("utf-8") + b"\x00\x00"
+        self.sock.sendall(struct.pack("<i", len(payload)) + payload)
+        resp_id, data = self._recv()
+        if ptype == 3 and resp_id == -1:
+            return None  # auth fail
+        return data
+
+    def _recv(self):
+        length = struct.unpack("<i", self._read(4))[0]
+        raw = self._read(length)
+        resp_id, _ptype = struct.unpack("<ii", raw[:8])
+        body = raw[8:-2].decode("utf-8", errors="replace")
+        return resp_id, body
+
+    def _read(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise RconError("conexion RCON cerrada")
+            buf += chunk
+        return buf
+
+    def command(self, cmd):
+        return self._send(2, cmd)
+
+
+def rcon_command(cmd):
+    with Rcon(RCON_HOST, RCON_PORT, RCON_PASSWORD) as r:
+        return r.command(cmd)
+
+
+# ---------------------------------------------------------------------------
+# Auth opcional (HTTP Basic si PANEL_PASSWORD esta definido)
+# ---------------------------------------------------------------------------
+def require_auth(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if PANEL_PASSWORD:
+            auth = request.authorization
+            if not auth or auth.password != PANEL_PASSWORD:
+                return Response(
+                    "Auth requerida", 401,
+                    {"WWW-Authenticate": 'Basic realm="Panel Minecraft"'},
+                )
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Helpers Docker
+# ---------------------------------------------------------------------------
+def get_container():
+    return _docker.containers.get(MC_CONTAINER)
+
+
+def container_env(c):
+    return dict(
+        e.split("=", 1) for e in c.attrs["Config"]["Env"] if "=" in e
+    )
+
+
+def cpu_mem_stats(c):
+    s = c.stats(stream=False)
+    # CPU %
+    cpu_pct = 0.0
+    try:
+        cpu = s["cpu_stats"]
+        pre = s["precpu_stats"]
+        cpu_delta = cpu["cpu_usage"]["total_usage"] - pre["cpu_usage"]["total_usage"]
+        sys_delta = cpu["system_cpu_usage"] - pre.get("system_cpu_usage", 0)
+        ncpu = cpu.get("online_cpus") or len(cpu["cpu_usage"].get("percpu_usage") or [1])
+        if sys_delta > 0 and cpu_delta > 0:
+            cpu_pct = (cpu_delta / sys_delta) * ncpu * 100.0
+    except (KeyError, TypeError):
+        pass
+    # Mem
+    mem = s.get("memory_stats", {})
+    used = mem.get("usage", 0) - mem.get("stats", {}).get("inactive_file", 0)
+    limit = mem.get("limit", 0)
+    return {
+        "cpu_pct": round(cpu_pct, 1),
+        "mem_used_mb": round(used / 1024 / 1024, 1),
+        "mem_limit_mb": round(limit / 1024 / 1024, 1),
+        "mem_pct": round(used / limit * 100, 1) if limit else 0,
+    }
+
+
+def parse_players(list_output):
+    # "There are 2 of a max of 20 players online: alice, bob"
+    if not list_output:
+        return {"online": 0, "max": 0, "names": []}
+    try:
+        head, _, tail = list_output.partition(":")
+        parts = head.split()
+        online = int(parts[2])
+        maximum = int(parts[7])
+        names = [n.strip() for n in tail.split(",") if n.strip()]
+        return {"online": online, "max": maximum, "names": names}
+    except (IndexError, ValueError):
+        return {"online": 0, "max": 0, "names": [], "raw": list_output}
+
+
+# ---------------------------------------------------------------------------
+# Rutas
+# ---------------------------------------------------------------------------
+@app.route("/")
+@require_auth
+def index():
+    return render_template("index.html", container=MC_CONTAINER)
+
+
+@app.route("/api/status")
+@require_auth
+def api_status():
+    try:
+        c = get_container()
+    except docker.errors.NotFound:
+        return jsonify({"state": "missing", "container": MC_CONTAINER})
+
+    env = container_env(c)
+    out = {
+        "container": MC_CONTAINER,
+        "state": c.status,
+        "started_at": c.attrs["State"].get("StartedAt"),
+        "health": c.attrs["State"].get("Health", {}).get("Status"),
+        "type": env.get("TYPE"),
+        "version": env.get("VERSION"),
+        "port": env.get("SERVER_PORT", "25565"),
+    }
+    if c.status == "running":
+        try:
+            out["stats"] = cpu_mem_stats(c)
+        except Exception as e:  # noqa: BLE001
+            out["stats_error"] = str(e)
+        try:
+            out["players"] = parse_players(rcon_command("list"))
+        except Exception as e:  # noqa: BLE001
+            out["players_error"] = str(e)
+    return jsonify(out)
+
+
+@app.route("/api/command", methods=["POST"])
+@require_auth
+def api_command():
+    cmd = (request.json or {}).get("command", "").strip()
+    if not cmd:
+        return jsonify({"error": "comando vacio"}), 400
+    try:
+        return jsonify({"output": rcon_command(cmd)})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/power", methods=["POST"])
+@require_auth
+def api_power():
+    action = (request.json or {}).get("action")
+    if action not in ("start", "stop", "restart"):
+        return jsonify({"error": "accion invalida"}), 400
+    try:
+        c = get_container()
+        getattr(c, action)()
+        return jsonify({"ok": True, "action": action})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 502
+
+
+# ---------------------------------------------------------------------------
+# Mods
+# ---------------------------------------------------------------------------
+def _safe_mod_name(name):
+    name = secure_filename(name or "")
+    if not name.lower().endswith(".jar"):
+        raise ValueError("solo se permiten ficheros .jar")
+    return name
+
+
+@app.route("/api/mods")
+@require_auth
+def api_mods_list():
+    MODS_DIR.mkdir(parents=True, exist_ok=True)
+    mods = []
+    for f in sorted(MODS_DIR.iterdir()):
+        if f.is_file() and f.suffix.lower() == ".jar":
+            mods.append({"name": f.name, "size_kb": round(f.stat().st_size / 1024, 1)})
+    return jsonify({"mods": mods, "dir": str(MODS_DIR)})
+
+
+@app.route("/api/mods", methods=["POST"])
+@require_auth
+def api_mods_upload():
+    MODS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Subida de fichero (multipart)
+    if "file" in request.files:
+        f = request.files["file"]
+        try:
+            name = _safe_mod_name(f.filename)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        f.save(MODS_DIR / name)
+        return jsonify({"ok": True, "name": name})
+
+    # Descarga desde URL
+    url = (request.json or {}).get("url", "").strip() if request.is_json else ""
+    if url:
+        if not url.startswith(("http://", "https://")):
+            return jsonify({"error": "URL invalida"}), 400
+        name = url.split("?")[0].rstrip("/").split("/")[-1]
+        try:
+            name = _safe_mod_name(name)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            (MODS_DIR / name).write_bytes(data)
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": f"descarga fallida: {e}"}), 502
+        return jsonify({"ok": True, "name": name, "size_kb": round(len(data) / 1024, 1)})
+
+    return jsonify({"error": "falta fichero o url"}), 400
+
+
+@app.route("/api/mods/<name>", methods=["DELETE"])
+@require_auth
+def api_mods_delete(name):
+    try:
+        name = _safe_mod_name(name)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    target = MODS_DIR / name
+    if not target.is_file():
+        return jsonify({"error": "no existe"}), 404
+    target.unlink()
+    return jsonify({"ok": True, "name": name})
+
+
+# ---------------------------------------------------------------------------
+# Modpacks (ZIP de CurseForge o server pack)
+# ---------------------------------------------------------------------------
+UA = "Mozilla/5.0 (compatible; mc-panel)"
+LOADER_MAP = {"forge": 1, "fabric": 4, "quilt": 5, "neoforge": 6}
+
+
+def _cf_get(url):
+    req = urllib.request.Request(
+        url, headers={"x-api-key": CF_API_KEY, "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)["data"]
+
+
+def _cf_file_url(file_data):
+    """URL de descarga de un file-data de CurseForge (con fallback forgecdn)."""
+    url = file_data.get("downloadUrl")
+    fname = file_data.get("fileName")
+    if not url and fname:
+        fid = str(file_data["id"])
+        enc = urllib.parse.quote(fname)  # nombre puede tener espacios/acentos
+        url = f"https://edge.forgecdn.net/files/{fid[:4]}/{int(fid[4:])}/{enc}"
+    return url, fname
+
+
+def _cf_download(file_data):
+    """Descarga un file-data a MODS_DIR. Devuelve el nombre o lanza excepcion."""
+    url, fname = _cf_file_url(file_data)
+    if not url:
+        raise RconError("sin URL de descarga")
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        (MODS_DIR / secure_filename(fname)).write_bytes(resp.read())
+    return fname
+
+
+def _cf_loader_type(manifest):
+    loaders = manifest.get("minecraft", {}).get("modLoaders", [])
+    if loaders:
+        name = loaders[0].get("id", "").split("-")[0].lower()
+        return LOADER_MAP.get(name)
+    return None
+
+
+def _cf_latest_file(mod_id, game_version, loader_type):
+    """Fichero mas reciente compatible de un mod (por version MC + loader)."""
+    q = f"?gameVersion={urllib.parse.quote(game_version)}"
+    if loader_type:
+        q += f"&modLoaderType={loader_type}"
+    data = _cf_get(f"https://api.curseforge.com/v1/mods/{mod_id}/files{q}")
+    return data[0] if data else None  # la API los devuelve por fecha desc
+
+
+def _required_deps(file_data):
+    return [d["modId"] for d in file_data.get("dependencies", [])
+            if d.get("relationType") == 3]  # 3 = RequiredDependency
+
+
+def _resolve_deps(seed_files, game_version, loader_type, have, log):
+    """Descarga recursivamente dependencias requeridas que falten."""
+    from collections import deque
+    queue = deque()
+    for fd in seed_files:
+        queue.extend(_required_deps(fd))
+    added, visited = 0, set()
+    while queue:
+        mod_id = queue.popleft()
+        if mod_id in have or mod_id in visited:
+            continue
+        visited.add(mod_id)
+        try:
+            fd = _cf_latest_file(mod_id, game_version, loader_type)
+            if not fd:
+                log.append(f"dep {mod_id}: sin fichero compatible")
+                continue
+            name = _cf_download(fd)
+            have.add(mod_id)
+            added += 1
+            log.append(f"dep auto: {name}")
+            queue.extend(_required_deps(fd))
+        except Exception as e:  # noqa: BLE001
+            log.append(f"dep {mod_id} fallo: {e}")
+    return added
+
+
+def _merge_tree(src: Path, dst: Path):
+    """Copia recursivamente src dentro de dst, fusionando carpetas."""
+    count = 0
+    for item in src.rglob("*"):
+        rel = item.relative_to(src)
+        target = dst / rel
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+            count += 1
+    return count
+
+
+def _find_pack_root(extracted: Path):
+    """Si el zip tiene una unica carpeta raiz, desciende a ella."""
+    entries = [p for p in extracted.iterdir() if not p.name.startswith("__MACOSX")]
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return extracted
+
+
+def _install_curseforge(root: Path, log):
+    manifest = json.loads((root / "manifest.json").read_text())
+    files = manifest.get("files", [])
+    log.append(f"Modpack CurseForge: {manifest.get('name','?')} "
+               f"({len(files)} mods, MC {manifest.get('minecraft',{}).get('version','?')})")
+    loaders = manifest.get("minecraft", {}).get("modLoaders", [])
+    if loaders:
+        log.append(f"Loader recomendado: {loaders[0].get('id')}")
+
+    if not CF_API_KEY:
+        raise RconError(
+            "Este ZIP es un export de CurseForge (solo IDs, sin los .jar). "
+            "Configura CF_API_KEY en .env para descargarlos automaticamente, "
+            "o exporta un 'server pack' con los jars incluidos."
+        )
+
+    MODS_DIR.mkdir(parents=True, exist_ok=True)
+    game_version = manifest.get("minecraft", {}).get("version", "")
+    loader_type = _cf_loader_type(manifest)
+
+    installed, failed, seed = 0, [], []
+    have = set(f.get("projectID") for f in files)
+    for f in files:
+        mod_id, file_id = f.get("projectID"), f.get("fileID")
+        try:
+            fd = _cf_get(f"https://api.curseforge.com/v1/mods/{mod_id}/files/{file_id}")
+            _cf_download(fd)
+            seed.append(fd)
+            installed += 1
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{mod_id}/{file_id}: {e}")
+
+    # Auto-resolucion de dependencias requeridas que falten (ej. Create)
+    deps = _resolve_deps(seed, game_version, loader_type, have, log)
+
+    # overrides -> /data
+    ov = root / manifest.get("overrides", "overrides")
+    if ov.is_dir():
+        n = _merge_tree(ov, DATA_DIR)
+        log.append(f"overrides copiados: {n} ficheros")
+
+    log.append(f"Mods instalados: {installed}/{len(files)}" +
+               (f" (+{deps} dependencias auto)" if deps else ""))
+    if failed:
+        log.append(f"Fallidos ({len(failed)}): " + "; ".join(failed[:10]))
+    return {"installed": installed, "deps": deps, "failed": failed}
+
+
+def _install_serverpack(root: Path, log):
+    """ZIP con jars incluidos: fusiona todo (mods/, config/, etc.) en /data."""
+    mods_dirs = [p for p in root.rglob("mods") if p.is_dir()]
+    if not mods_dirs:
+        raise RconError("ZIP no reconocido: sin manifest.json ni carpeta mods/")
+    # Usa el directorio que contiene la carpeta mods/ como raiz del pack
+    base = mods_dirs[0].parent
+    n = _merge_tree(base, DATA_DIR)
+    jars = len(list((DATA_DIR / "mods").glob("*.jar"))) if (DATA_DIR / "mods").is_dir() else 0
+    log.append(f"Server pack: {n} ficheros copiados, {jars} mods en total")
+    return {"copied": n, "mods_total": jars}
+
+
+@app.route("/api/modpack", methods=["POST"])
+@require_auth
+def api_modpack():
+    if "file" not in request.files:
+        return jsonify({"error": "falta el fichero zip"}), 400
+    f = request.files["file"]
+    if not (f.filename or "").lower().endswith(".zip"):
+        return jsonify({"error": "solo se permiten ficheros .zip"}), 400
+
+    log = []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            with zipfile.ZipFile(io.BytesIO(f.read())) as z:
+                z.extractall(tmp)
+            root = _find_pack_root(tmp)
+            if (root / "manifest.json").is_file():
+                result = _install_curseforge(root, log)
+            else:
+                result = _install_serverpack(root, log)
+        return jsonify({"ok": True, "log": log, "result": result})
+    except RconError as e:
+        return jsonify({"error": str(e), "log": log}), 400
+    except zipfile.BadZipFile:
+        return jsonify({"error": "zip corrupto o invalido"}), 400
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e), "log": log}), 500
+
+
+@app.route("/api/logs")
+@require_auth
+def api_logs():
+    try:
+        c = get_container()
+        tail = request.args.get("tail", "100")
+        logs = c.logs(tail=int(tail)).decode("utf-8", errors="replace")
+        return jsonify({"logs": logs})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 502
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)

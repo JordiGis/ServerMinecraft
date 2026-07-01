@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel Minecraft — {{ container }}</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #1a1d24; --border: #2a2e38; --fg: #e6e8ec;
+    --muted: #8b909a; --green: #3fb950; --red: #f85149; --amber: #d29922;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+  .dot.running { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot.exited, .dot.missing { background: var(--red); }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase;
+    letter-spacing: .5px; color: var(--muted); }
+  .big { font-size: 28px; font-weight: 700; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 10px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+  .players { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .players li { background: var(--border); padding: 4px 10px; border-radius: 6px; font-size: 13px; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { cursor: pointer; border: 1px solid var(--border); background: #22262f;
+    color: var(--fg); padding: 8px 14px; border-radius: 8px; font-size: 14px; }
+  button:hover { border-color: var(--accent); }
+  button.stop:hover { border-color: var(--red); }
+  button.start:hover { border-color: var(--green); }
+  .console { margin-top: 16px; }
+  #out { background: #0a0c10; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; height: 260px; overflow-y: auto; white-space: pre-wrap;
+    font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+  .cmdrow { display: flex; gap: 8px; margin-top: 10px; }
+  #cmd { flex: 1; background: #0a0c10; border: 1px solid var(--border);
+    color: var(--fg); padding: 10px; border-radius: 8px; font-family: ui-monospace, monospace; }
+  .muted { color: var(--muted); }
+  .err { color: var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot" class="dot"></span>
+  <h1>Panel Minecraft — {{ container }}</h1>
+  <span id="statetxt" class="muted"></span>
+</header>
+
+<div class="wrap">
+  <div class="grid">
+    <div class="card">
+      <h2>Servidor</h2>
+      <div id="srv-type" class="big">—</div>
+      <div id="srv-sub" class="sub"></div>
+      <div class="btns" style="margin-top:14px">
+        <button class="start" onclick="power('start')">▶ Start</button>
+        <button onclick="power('restart')">⟳ Restart</button>
+        <button class="stop" onclick="power('stop')">■ Stop</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Jugadores</h2>
+      <div id="pl-count" class="big">—</div>
+      <ul id="pl-list" class="players"></ul>
+    </div>
+
+    <div class="card">
+      <h2>CPU</h2>
+      <div id="cpu-val" class="big">—</div>
+      <div class="bar"><i id="cpu-bar" style="width:0"></i></div>
+    </div>
+
+    <div class="card">
+      <h2>Memoria</h2>
+      <div id="mem-val" class="big">—</div>
+      <div class="bar"><i id="mem-bar" style="width:0"></i></div>
+      <div id="mem-sub" class="sub"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Modpack (ZIP CurseForge / server pack)</h2>
+    <div class="cmdrow" style="margin-top:0">
+      <input type="file" id="packfile" accept=".zip">
+      <button onclick="uploadPack()">Instalar ZIP</button>
+    </div>
+    <div class="sub">Export de CurseForge (con <code>manifest.json</code>) requiere <b>CF_API_KEY</b> en <code>.env</code>. Un "server pack" con los .jar dentro se instala directo. Al terminar, pulsa <b>Restart</b>.</div>
+    <div id="pack-out" class="sub"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Mods (.jar)</h2>
+    <div class="cmdrow" style="margin-top:0">
+      <input type="file" id="modfile" accept=".jar">
+      <button onclick="uploadMod()">Subir</button>
+    </div>
+    <div class="cmdrow">
+      <input id="modurl" placeholder="URL directa a un .jar (Modrinth/CurseForge/…)" autocomplete="off">
+      <button onclick="addModUrl()">Descargar</button>
+    </div>
+    <ul id="mod-list" class="players" style="flex-direction:column; align-items:stretch; gap:6px; margin-top:14px"></ul>
+    <div class="sub" id="mod-note">Tras cambiar mods, pulsa <b>Restart</b> para aplicar.</div>
+  </div>
+
+  <div class="card console">
+    <h2>Consola RCON</h2>
+    <div id="out" class="muted">Cargando…</div>
+    <div class="cmdrow">
+      <input id="cmd" placeholder="say hola   |   op jugador   |   list" autocomplete="off">
+      <button onclick="send()">Enviar</button>
+      <button onclick="refreshLogs()">Ver logs</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function log(txt, cls) {
+  const out = $("out");
+  const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+  out.classList.remove("muted");
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = txt;
+  out.appendChild(line);
+  if (atBottom) out.scrollTop = out.scrollHeight;
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/status");
+    const s = await r.json();
+    const running = s.state === "running";
+    $("dot").className = "dot " + s.state;
+    $("statetxt").textContent = s.state + (s.health ? " · " + s.health : "");
+
+    $("srv-type").textContent = s.type || s.state;
+    $("srv-sub").textContent = (s.version ? "v" + s.version + " · " : "") + "puerto " + (s.port || "?");
+
+    if (s.players) {
+      $("pl-count").textContent = s.players.online + " / " + s.players.max;
+      $("pl-list").innerHTML = (s.players.names || []).map(n => "<li>" + n + "</li>").join("");
+    } else {
+      $("pl-count").textContent = running ? "?" : "—";
+      $("pl-list").innerHTML = "";
+    }
+
+    if (s.stats) {
+      $("cpu-val").textContent = s.stats.cpu_pct + " %";
+      $("cpu-bar").style.width = Math.min(100, s.stats.cpu_pct) + "%";
+      $("mem-val").textContent = s.stats.mem_pct + " %";
+      $("mem-bar").style.width = Math.min(100, s.stats.mem_pct) + "%";
+      $("mem-sub").textContent = s.stats.mem_used_mb + " / " + s.stats.mem_limit_mb + " MB";
+    } else {
+      $("cpu-val").textContent = "—"; $("mem-val").textContent = "—";
+      $("cpu-bar").style.width = "0"; $("mem-bar").style.width = "0";
+      $("mem-sub").textContent = "";
+    }
+  } catch (e) { $("statetxt").textContent = "error de conexion"; }
+}
+
+async function send() {
+  const cmd = $("cmd").value.trim();
+  if (!cmd) return;
+  log("> " + cmd, "");
+  $("cmd").value = "";
+  try {
+    const r = await fetch("/api/command", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({command: cmd})
+    });
+    const d = await r.json();
+    if (d.error) log(d.error, "err");
+    else log(d.output || "(sin salida)");
+  } catch (e) { log("fallo: " + e, "err"); }
+}
+
+async function power(action) {
+  if (!confirm("¿Seguro que quieres " + action + " el servidor?")) return;
+  log("[power] " + action + "…", "muted");
+  try {
+    const r = await fetch("/api/power", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action})
+    });
+    const d = await r.json();
+    log(d.error ? "[power] " + d.error : "[power] ok: " + action, d.error ? "err" : "muted");
+  } catch (e) { log("[power] fallo: " + e, "err"); }
+}
+
+async function refreshLogs() {
+  try {
+    const r = await fetch("/api/logs?tail=80");
+    const d = await r.json();
+    $("out").innerHTML = "";
+    $("out").classList.remove("muted");
+    if (d.error) log(d.error, "err");
+    else d.logs.split("\n").forEach(l => log(l));
+  } catch (e) { log("fallo logs: " + e, "err"); }
+}
+
+async function loadMods() {
+  try {
+    const r = await fetch("/api/mods");
+    const d = await r.json();
+    const ul = $("mod-list");
+    if (!d.mods || !d.mods.length) {
+      ul.innerHTML = '<li class="muted">Sin mods instalados</li>';
+      return;
+    }
+    ul.innerHTML = d.mods.map(m =>
+      '<li style="display:flex;justify-content:space-between;align-items:center">' +
+      '<span>' + m.name + ' <span class="muted">(' + m.size_kb + ' KB)</span></span>' +
+      '<button class="stop" onclick="deleteMod(\'' + m.name.replace(/'/g, "\\'") + '\')">Borrar</button>' +
+      '</li>'
+    ).join("");
+  } catch (e) { $("mod-list").innerHTML = '<li class="err">error al listar</li>'; }
+}
+
+async function uploadPack() {
+  const inp = $("packfile");
+  if (!inp.files.length) return;
+  const box = $("pack-out");
+  box.textContent = "Instalando… (puede tardar si descarga mods de CurseForge)";
+  const fd = new FormData();
+  fd.append("file", inp.files[0]);
+  try {
+    const r = await fetch("/api/modpack", { method: "POST", body: fd });
+    const d = await r.json();
+    const lines = (d.log || []).concat(d.error ? ["ERROR: " + d.error] : ["OK"]);
+    box.innerHTML = lines.map(l => "• " + l).join("<br>");
+    box.className = "sub" + (d.error ? " err" : "");
+  } catch (e) { box.className = "sub err"; box.textContent = "fallo: " + e; }
+  inp.value = "";
+  loadMods();
+}
+
+async function uploadMod() {
+  const inp = $("modfile");
+  if (!inp.files.length) return;
+  const fd = new FormData();
+  fd.append("file", inp.files[0]);
+  const r = await fetch("/api/mods", { method: "POST", body: fd });
+  const d = await r.json();
+  log(d.error ? "[mod] " + d.error : "[mod] subido: " + d.name, d.error ? "err" : "muted");
+  inp.value = "";
+  loadMods();
+}
+
+async function addModUrl() {
+  const url = $("modurl").value.trim();
+  if (!url) return;
+  log("[mod] descargando…", "muted");
+  const r = await fetch("/api/mods", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({url})
+  });
+  const d = await r.json();
+  log(d.error ? "[mod] " + d.error : "[mod] descargado: " + d.name, d.error ? "err" : "muted");
+  $("modurl").value = "";
+  loadMods();
+}
+
+async function deleteMod(name) {
+  if (!confirm("¿Borrar mod " + name + "?")) return;
+  const r = await fetch("/api/mods/" + encodeURIComponent(name), { method: "DELETE" });
+  const d = await r.json();
+  log(d.error ? "[mod] " + d.error : "[mod] borrado: " + name, d.error ? "err" : "muted");
+  loadMods();
+}
+
+$("cmd").addEventListener("keydown", e => { if (e.key === "Enter") send(); });
+poll();
+loadMods();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>

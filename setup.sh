@@ -93,6 +93,13 @@ MOTD=$(ask "MOTD (mensaje del servidor)" "Servidor Minecraft Docker")
 OPS=$(ask "Operadores/admins (nicks separados por coma, vacio = ninguno)" "")
 TZ=$(ask "Zona horaria" "Europe/Madrid")
 
+# 6) Panel web
+title "Panel web"
+RCON_PASSWORD=$(ask "Contrasena RCON (panel <-> server)" "minecraft")
+PANEL_PORT=$(ask "Puerto del panel web" "8100")
+PANEL_PASSWORD=$(ask "Contrasena del panel (vacio = sin login)" "")
+CF_API_KEY=$(ask "CurseForge API key (para modpacks, vacio = ninguno)" "")
+
 # ---- escribir .env ---------------------------------------------------------
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -114,6 +121,10 @@ MAX_PLAYERS=$MAX_PLAYERS
 MOTD=$MOTD
 OPS=$OPS
 TZ=$TZ
+RCON_PASSWORD=$RCON_PASSWORD
+PANEL_PORT=$PANEL_PORT
+PANEL_PASSWORD=$PANEL_PASSWORD
+CF_API_KEY=$CF_API_KEY
 EOF
 
 title "Configuracion guardada en $ENV_FILE"
@@ -130,6 +141,7 @@ if [[ "$start" == "Si" ]]; then
   title "Arrancando (docker compose up -d)"
   docker compose up -d
   echo
+  echo "Panel web:      http://localhost:${PANEL_PORT}"
   echo "Logs en vivo:   docker compose logs -f"
   echo "Consola RCON:   docker exec -i $SERVER_NAME rcon-cli"
   echo "Parar:          docker compose down"

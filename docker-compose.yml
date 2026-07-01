@@ -16,6 +16,8 @@ services:
       FABRIC_LOADER_VERSION: ${LOADER_VERSION:-}
       ONLINE_MODE: ${ONLINE_MODE:-TRUE}
       MEMORY: ${MEMORY:-2G}
+      ENABLE_RCON: "TRUE"
+      RCON_PASSWORD: ${RCON_PASSWORD:-minecraft}
       DIFFICULTY: ${DIFFICULTY:-normal}
       MOTD: ${MOTD:-Servidor Minecraft Docker}
       MAX_PLAYERS: ${MAX_PLAYERS:-20}
@@ -28,3 +30,25 @@ services:
       start_period: 1m
       interval: 5s
       retries: 20
+
+  panel:
+    build: ./web
+    container_name: ${SERVER_NAME:-minecraft}-panel
+    restart: unless-stopped
+    ports:
+      - "${PANEL_PORT:-8100}:8000"
+    environment:
+      RCON_HOST: mc
+      RCON_PORT: "25575"
+      RCON_PASSWORD: ${RCON_PASSWORD:-minecraft}
+      MC_CONTAINER: ${SERVER_NAME:-minecraft}
+      PANEL_PASSWORD: ${PANEL_PASSWORD:-}
+      DATA_DIR: /data
+      MODS_DIR: /data/mods
+      CF_API_KEY: ${CF_API_KEY:-}
+      TZ: ${TZ:-Europe/Madrid}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/data
+    depends_on:
+      - mc
