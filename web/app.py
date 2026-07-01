@@ -437,9 +437,12 @@ def _merge_tree(src: Path, dst: Path):
 
 
 def _find_pack_root(extracted: Path):
-    """Si el zip tiene una unica carpeta raiz, desciende a ella."""
+    """Si el zip tiene una unica carpeta raiz envolvente, desciende a ella.
+    No desciende si esa carpeta ya es parte del contenido del pack
+    (mods/overrides/config), para no romper la deteccion de server pack."""
     entries = [p for p in extracted.iterdir() if not p.name.startswith("__MACOSX")]
-    if len(entries) == 1 and entries[0].is_dir():
+    if (len(entries) == 1 and entries[0].is_dir()
+            and entries[0].name.lower() not in ("mods", "overrides", "config")):
         return entries[0]
     return extracted
 
