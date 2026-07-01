@@ -621,6 +621,13 @@ def _zip_dir(src: Path, zf: zipfile.ZipFile, base: Path):
             zf.write(p, p.relative_to(base))
 
 
+def _server_running():
+    try:
+        return get_container().status == "running"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _make_backup(label=""):
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     world = _world_path()
@@ -630,8 +637,27 @@ def _make_backup(label=""):
     stem = secure_filename(label) or "backup"
     fname = f"{stem}-{ts}.zip"
     target = BACKUP_DIR / fname
-    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        _zip_dir(world, z, world.parent)  # rutas relativas: world/...
+
+    # Backup en caliente: pausa el guardado y vuelca a disco para evitar
+    # regiones a medio escribir. Si el server no responde por RCON, se hace
+    # igualmente (mejor un backup imperfecto que ninguno).
+    hot = _server_running()
+    if hot:
+        try:
+            rcon_command("save-off")
+            rcon_command("save-all flush")
+            time.sleep(1)
+        except Exception:  # noqa: BLE001
+            hot = False
+    try:
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            _zip_dir(world, z, world.parent)  # rutas relativas: world/...
+    finally:
+        if hot:
+            try:
+                rcon_command("save-on")
+            except Exception:  # noqa: BLE001
+                pass
     return {"name": fname, "size_mb": round(target.stat().st_size / 1048576, 2)}
 
 
