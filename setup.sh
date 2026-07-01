@@ -60,7 +60,13 @@ printf '%s' "$c_reset"
 
 # 1) Tipo de servidor
 TYPE=$(menu "Tipo de servidor:" 1 \
-  "PAPER" "VANILLA" "FABRIC" "FORGE" "SPIGOT" "PURPUR")
+  "PAPER" "NEOFORGE" "FABRIC" "FORGE" "VANILLA" "SPIGOT" "PURPUR")
+
+# Version concreta del loader (NeoForge/Forge/Fabric). Vacio = auto.
+LOADER_VERSION=""
+if [[ "$TYPE" == "NEOFORGE" || "$TYPE" == "FORGE" || "$TYPE" == "FABRIC" ]]; then
+  LOADER_VERSION=$(ask "Version de $TYPE (vacio = ultima compatible)" "")
+fi
 
 # 2) Version
 VERSION=$(menu "Version de Minecraft:" 1 \
@@ -99,6 +105,7 @@ cat > "$ENV_FILE" <<EOF
 SERVER_NAME=$SERVER_NAME
 TYPE=$TYPE
 VERSION=$VERSION
+LOADER_VERSION=$LOADER_VERSION
 ONLINE_MODE=$ONLINE_MODE
 MEMORY=$MEMORY
 PORT=$PORT
