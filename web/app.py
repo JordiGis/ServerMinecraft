@@ -7,19 +7,23 @@ Funciones:
   - Control start/stop/restart (Docker API)
 """
 import os
+import datetime
 import functools
+import re
 import io
 import json
 import shutil
 import socket
 import struct
 import tempfile
+import threading
+import time
 import urllib.request
 import urllib.parse
 import zipfile
 from pathlib import Path
 
-from flask import Flask, request, jsonify, Response, render_template
+from flask import Flask, request, jsonify, Response, render_template, send_file
 from werkzeug.utils import secure_filename
 import docker
 
@@ -31,6 +35,8 @@ PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 MODS_DIR = Path(os.environ.get("MODS_DIR", "/data/mods"))
 CF_API_KEY = os.environ.get("CF_API_KEY", "")
+BACKUP_DIR = DATA_DIR / "backups"
+SCHEDULE_FILE = DATA_DIR / "panel-schedule.json"
 
 app = Flask(__name__)
 _docker = docker.from_env()
@@ -247,9 +253,35 @@ def api_mods_list():
     MODS_DIR.mkdir(parents=True, exist_ok=True)
     mods = []
     for f in sorted(MODS_DIR.iterdir()):
-        if f.is_file() and f.suffix.lower() == ".jar":
-            mods.append({"name": f.name, "size_kb": round(f.stat().st_size / 1024, 1)})
+        low = f.name.lower()
+        if not f.is_file():
+            continue
+        if low.endswith(".jar"):
+            mods.append({"name": f.name, "size_kb": round(f.stat().st_size / 1024, 1),
+                         "enabled": True})
+        elif low.endswith(".jar.disabled"):
+            mods.append({"name": f.name[:-len(".disabled")],
+                         "size_kb": round(f.stat().st_size / 1024, 1), "enabled": False})
+    mods.sort(key=lambda m: m["name"].lower())
     return jsonify({"mods": mods, "dir": str(MODS_DIR)})
+
+
+@app.route("/api/mods/<name>/toggle", methods=["POST"])
+@require_auth
+def api_mods_toggle(name):
+    try:
+        name = _safe_mod_name(name)  # nombre base .jar
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    enabled = MODS_DIR / name
+    disabled = MODS_DIR / (name + ".disabled")
+    if enabled.is_file():
+        enabled.rename(disabled)
+        return jsonify({"ok": True, "enabled": False, "name": name})
+    if disabled.is_file():
+        disabled.rename(enabled)
+        return jsonify({"ok": True, "enabled": True, "name": name})
+    return jsonify({"error": "no existe"}), 404
 
 
 @app.route("/api/mods", methods=["POST"])
@@ -500,6 +532,365 @@ def api_modpack():
         return jsonify({"error": "zip corrupto o invalido"}), 400
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e), "log": log}), 500
+
+
+# ---------------------------------------------------------------------------
+# server.properties
+# ---------------------------------------------------------------------------
+PROPS_FILE = DATA_DIR / "server.properties"
+# Claves editables mostradas en el panel (el resto se preserva sin tocar)
+EDITABLE_PROPS = [
+    "level-seed", "level-name", "level-type", "difficulty", "gamemode",
+    "motd", "max-players", "view-distance", "simulation-distance",
+    "pvp", "hardcore", "white-list", "enforce-whitelist", "online-mode",
+    "spawn-protection", "allow-nether", "allow-flight", "enable-command-block",
+    "spawn-monsters", "force-gamemode",
+]
+
+
+def _read_properties():
+    props = {}
+    if PROPS_FILE.is_file():
+        for line in PROPS_FILE.read_text().splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and "=" in s:
+                k, v = s.split("=", 1)
+                props[k] = v
+    return props
+
+
+def _write_properties(updates):
+    lines = PROPS_FILE.read_text().splitlines() if PROPS_FILE.is_file() else []
+    seen, out = set(), []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k = s.split("=", 1)[0]
+            if k in updates:
+                out.append(f"{k}={updates[k]}")
+                seen.add(k)
+                continue
+        out.append(line)
+    for k, v in updates.items():
+        if k not in seen:
+            out.append(f"{k}={v}")
+    PROPS_FILE.write_text("\n".join(out) + "\n")
+
+
+def _level_name():
+    return _read_properties().get("level-name", "world")
+
+
+def _world_path():
+    return DATA_DIR / _level_name()
+
+
+@app.route("/api/properties")
+@require_auth
+def api_properties_get():
+    props = _read_properties()
+    return jsonify({
+        "editable": {k: props.get(k, "") for k in EDITABLE_PROPS},
+        "all_keys": sorted(props.keys()),
+    })
+
+
+@app.route("/api/properties", methods=["POST"])
+@require_auth
+def api_properties_set():
+    updates = (request.json or {}).get("properties", {})
+    if not isinstance(updates, dict) or not updates:
+        return jsonify({"error": "sin cambios"}), 400
+    # Solo permitir claves conocidas para evitar romper el fichero
+    updates = {k: str(v) for k, v in updates.items() if k in EDITABLE_PROPS}
+    _write_properties(updates)
+    if (request.json or {}).get("restart"):
+        try:
+            get_container().restart()
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": True, "restart_error": str(e), "saved": updates})
+    return jsonify({"ok": True, "saved": updates})
+
+
+# ---------------------------------------------------------------------------
+# Backups y descarga del mundo
+# ---------------------------------------------------------------------------
+def _zip_dir(src: Path, zf: zipfile.ZipFile, base: Path):
+    for p in src.rglob("*"):
+        if p.is_file():
+            zf.write(p, p.relative_to(base))
+
+
+def _make_backup(label=""):
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    world = _world_path()
+    if not world.is_dir():
+        raise RconError("no existe el mundo a respaldar")
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = secure_filename(label) or "backup"
+    fname = f"{stem}-{ts}.zip"
+    target = BACKUP_DIR / fname
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        _zip_dir(world, z, world.parent)  # rutas relativas: world/...
+    return {"name": fname, "size_mb": round(target.stat().st_size / 1048576, 2)}
+
+
+@app.route("/api/backups")
+@require_auth
+def api_backups_list():
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    out = []
+    for f in sorted(BACKUP_DIR.glob("*.zip"), reverse=True):
+        st = f.stat()
+        out.append({
+            "name": f.name,
+            "size_mb": round(st.st_size / 1048576, 2),
+            "date": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+        })
+    return jsonify({"backups": out})
+
+
+@app.route("/api/backups", methods=["POST"])
+@require_auth
+def api_backups_create():
+    label = (request.json or {}).get("label", "") if request.is_json else ""
+    try:
+        return jsonify({"ok": True, **_make_backup(label)})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/backups/<name>/download")
+@require_auth
+def api_backups_download(name):
+    name = secure_filename(name)
+    target = BACKUP_DIR / name
+    if not target.is_file():
+        return jsonify({"error": "no existe"}), 404
+    return send_file(target, as_attachment=True, download_name=name)
+
+
+@app.route("/api/backups/<name>", methods=["DELETE"])
+@require_auth
+def api_backups_delete(name):
+    name = secure_filename(name)
+    target = BACKUP_DIR / name
+    if not target.is_file():
+        return jsonify({"error": "no existe"}), 404
+    target.unlink()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/backups/<name>/restore", methods=["POST"])
+@require_auth
+def api_backups_restore(name):
+    name = secure_filename(name)
+    target = BACKUP_DIR / name
+    if not target.is_file():
+        return jsonify({"error": "no existe"}), 404
+    world = _world_path()
+    try:
+        c = get_container()
+        c.stop()
+        if world.is_dir():
+            shutil.rmtree(world)
+        with zipfile.ZipFile(target) as z:
+            z.extractall(DATA_DIR)  # el zip contiene la carpeta world/
+        c.start()
+        return jsonify({"ok": True, "restored": name})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/world/download")
+@require_auth
+def api_world_download():
+    world = _world_path()
+    if not world.is_dir():
+        return jsonify({"error": "no existe el mundo"}), 404
+    tmp = Path(tempfile.gettempdir()) / f"{_level_name()}.zip"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        _zip_dir(world, z, world.parent)
+    return send_file(tmp, as_attachment=True, download_name=f"{_level_name()}.zip")
+
+
+@app.route("/api/world/regenerate", methods=["POST"])
+@require_auth
+def api_world_regenerate():
+    body = request.json or {}
+    seed = str(body.get("seed", "")).strip()
+    level_type = body.get("level_type", "").strip()
+    world = _world_path()
+    try:
+        # Respaldo del mundo actual antes de borrar
+        if world.is_dir():
+            _make_backup("pre-regen")
+        c = get_container()
+        c.stop()
+        updates = {"level-seed": seed}
+        if level_type:
+            updates["level-type"] = level_type
+        _write_properties(updates)
+        if world.is_dir():
+            shutil.rmtree(world)
+        c.start()
+        return jsonify({"ok": True, "seed": seed})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Scheduling: backup y restart automaticos (thread en background)
+# ---------------------------------------------------------------------------
+DEFAULT_SCHEDULE = {
+    "backup_enabled": False, "backup_interval_h": 24,
+    "restart_enabled": False, "restart_interval_h": 12,
+    "last_backup": 0, "last_restart": 0,
+}
+
+
+def _load_schedule():
+    cfg = dict(DEFAULT_SCHEDULE)
+    if SCHEDULE_FILE.is_file():
+        try:
+            cfg.update(json.loads(SCHEDULE_FILE.read_text()))
+        except Exception:  # noqa: BLE001
+            pass
+    return cfg
+
+
+def _save_schedule(cfg):
+    SCHEDULE_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+@app.route("/api/schedule")
+@require_auth
+def api_schedule_get():
+    return jsonify(_load_schedule())
+
+
+@app.route("/api/schedule", methods=["POST"])
+@require_auth
+def api_schedule_set():
+    cfg = _load_schedule()
+    body = request.json or {}
+    for k in ("backup_enabled", "restart_enabled"):
+        if k in body:
+            cfg[k] = bool(body[k])
+    for k in ("backup_interval_h", "restart_interval_h"):
+        if k in body:
+            try:
+                cfg[k] = max(1, int(body[k]))
+            except (ValueError, TypeError):
+                pass
+    _save_schedule(cfg)
+    return jsonify(cfg)
+
+
+def _scheduler_loop():
+    while True:
+        time.sleep(60)
+        try:
+            cfg = _load_schedule()
+            now = time.time()
+            changed = False
+            # last_*=0 => recien arrancado: fija baseline sin ejecutar
+            if cfg["last_backup"] == 0 or cfg["last_restart"] == 0:
+                if cfg["last_backup"] == 0:
+                    cfg["last_backup"] = now
+                if cfg["last_restart"] == 0:
+                    cfg["last_restart"] = now
+                _save_schedule(cfg)
+                continue
+            if cfg["backup_enabled"] and now - cfg["last_backup"] >= cfg["backup_interval_h"] * 3600:
+                try:
+                    _make_backup("auto")
+                except Exception:  # noqa: BLE001
+                    pass
+                cfg["last_backup"] = now
+                changed = True
+            if cfg["restart_enabled"] and now - cfg["last_restart"] >= cfg["restart_interval_h"] * 3600:
+                try:
+                    get_container().restart()
+                except Exception:  # noqa: BLE001
+                    pass
+                cfg["last_restart"] = now
+                changed = True
+            if changed:
+                _save_schedule(cfg)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+threading.Thread(target=_scheduler_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Auto-reparar: saca a cuarentena mods client-only que crashean el server
+# ---------------------------------------------------------------------------
+QUAR_DIR = DATA_DIR / "client-only-removed"
+
+
+def _jar_for_modid(modid):
+    for j in MODS_DIR.glob("*.jar"):
+        try:
+            with zipfile.ZipFile(j) as z:
+                names = z.namelist()
+                for toml in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
+                    if toml in names:
+                        txt = z.read(toml).decode("utf-8", "replace")
+                        if re.search(r'modId\s*=\s*"%s"' % re.escape(modid), txt):
+                            return j
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def _wait_health(c, timeout=180):
+    end = time.time() + timeout
+    while time.time() < end:
+        c.reload()
+        h = c.attrs["State"].get("Health", {}).get("Status")
+        st = c.status
+        if h == "healthy" or (not h and st == "running"):
+            return "ok"
+        if h == "unhealthy" or st in ("exited", "dead"):
+            return "bad"
+        time.sleep(5)
+    return "timeout"
+
+
+@app.route("/api/heal", methods=["POST"])
+@require_auth
+def api_heal():
+    QUAR_DIR.mkdir(parents=True, exist_ok=True)
+    steps, quarantined = [], []
+    try:
+        c = get_container()
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+    for _ in range(12):
+        c.restart()
+        res = _wait_health(c, timeout=180)
+        if res == "ok":
+            return jsonify({"ok": True, "quarantined": quarantined, "steps": steps})
+        logs = c.logs(tail=200).decode("utf-8", "replace")
+        logs = re.sub(r"\x1b\[[0-9;]*m", "", logs)
+        m = re.findall(r"\(([a-z0-9_]+)\) has failed to load", logs)
+        if not m:
+            steps.append("no se pudo identificar el mod culpable")
+            return jsonify({"ok": False, "quarantined": quarantined, "steps": steps,
+                            "hint": "revisa los logs manualmente"}), 200
+        modid = m[-1]
+        jar = _jar_for_modid(modid)
+        if not jar:
+            steps.append(f"mod '{modid}' crashea pero no encuentro su .jar")
+            return jsonify({"ok": False, "quarantined": quarantined, "steps": steps}), 200
+        jar.rename(QUAR_DIR / jar.name)
+        quarantined.append(jar.name)
+        steps.append(f"cuarentena: {modid} -> {jar.name}")
+    return jsonify({"ok": False, "quarantined": quarantined, "steps": steps,
+                    "hint": "alcanzado limite de intentos"}), 200
 
 
 @app.route("/api/logs")

@@ -66,6 +66,10 @@
         <button onclick="power('restart')">⟳ Restart</button>
         <button class="stop" onclick="power('stop')">■ Stop</button>
       </div>
+      <div class="btns" style="margin-top:8px">
+        <button onclick="heal()">🩹 Auto-reparar</button>
+      </div>
+      <div id="heal-msg" class="sub"></div>
     </div>
 
     <div class="card">
@@ -110,6 +114,79 @@
     </div>
     <ul id="mod-list" class="players" style="flex-direction:column; align-items:stretch; gap:6px; margin-top:14px"></ul>
     <div class="sub" id="mod-note">Tras cambiar mods, pulsa <b>Restart</b> para aplicar.</div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Ajustes del servidor (server.properties)</h2>
+    <div id="props-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px"></div>
+    <div class="cmdrow">
+      <button onclick="saveProps(false)">Guardar</button>
+      <button onclick="saveProps(true)">Guardar y reiniciar</button>
+      <span id="props-msg" class="sub" style="align-self:center"></span>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Mundo · Backups</h2>
+    <div class="cmdrow" style="margin-top:0">
+      <input id="bk-label" placeholder="etiqueta del backup (opcional)" autocomplete="off">
+      <button onclick="createBackup()">Crear backup</button>
+      <button onclick="location.href='/api/world/download'">⬇ Descargar mundo</button>
+    </div>
+    <ul id="bk-list" class="players" style="flex-direction:column;align-items:stretch;gap:6px;margin-top:14px"></ul>
+    <div id="bk-msg" class="sub"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Regenerar mundo con seed</h2>
+    <div class="cmdrow" style="margin-top:0">
+      <input id="seed" placeholder="seed (vacio = aleatoria)" autocomplete="off">
+      <select id="leveltype" style="background:#0a0c10;border:1px solid var(--border);color:var(--fg);border-radius:8px;padding:0 8px">
+        <option value="">tipo: (sin cambio)</option>
+        <option value="minecraft:normal">normal</option>
+        <option value="minecraft:flat">flat</option>
+        <option value="minecraft:large_biomes">large_biomes</option>
+        <option value="minecraft:amplified">amplified</option>
+      </select>
+      <button class="stop" onclick="regenWorld()">Regenerar</button>
+    </div>
+    <div class="sub err">⚠ Borra el mundo actual (se hace backup antes). La seed solo aplica a mundo nuevo.</div>
+    <div id="seed-msg" class="sub"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Jugadores</h2>
+    <div class="cmdrow" style="margin-top:0">
+      <input id="pl-name" placeholder="nombre del jugador" autocomplete="off">
+      <button onclick="plCmd('op')">OP</button>
+      <button onclick="plCmd('deop')">DeOP</button>
+      <button onclick="plCmd('whitelist add')">Whitelist +</button>
+      <button onclick="plCmd('whitelist remove')">Whitelist −</button>
+      <button onclick="plCmd('kick')">Kick</button>
+      <button class="stop" onclick="plCmd('ban')">Ban</button>
+    </div>
+    <div class="cmdrow">
+      <button onclick="rconTo('whitelist list')">Ver whitelist</button>
+      <button onclick="rconTo('banlist')">Ver baneados</button>
+      <button onclick="rconTo('list')">Ver conectados</button>
+    </div>
+    <div id="pl-msg" class="sub"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Tareas automaticas</h2>
+    <div class="cmdrow" style="margin-top:0">
+      <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="sc-bk"> Backup auto cada</label>
+      <input id="sc-bk-h" type="number" min="1" style="width:70px;background:#0a0c10;border:1px solid var(--border);color:var(--fg);border-radius:8px;padding:8px"> h
+    </div>
+    <div class="cmdrow">
+      <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="sc-rs"> Restart auto cada</label>
+      <input id="sc-rs-h" type="number" min="1" style="width:70px;background:#0a0c10;border:1px solid var(--border);color:var(--fg);border-radius:8px;padding:8px"> h
+    </div>
+    <div class="cmdrow">
+      <button onclick="saveSchedule()">Guardar tareas</button>
+      <span id="sc-msg" class="sub" style="align-self:center"></span>
+    </div>
   </div>
 
   <div class="card console">
@@ -186,6 +263,22 @@ async function send() {
   } catch (e) { log("fallo: " + e, "err"); }
 }
 
+async function heal() {
+  if (!confirm("Auto-reparar: reinicia el server en bucle y saca a cuarentena los mods que lo crashean (client-only). ¿Continuar?")) return;
+  $("heal-msg").textContent = "reparando… (puede tardar varios minutos)";
+  try {
+    const r = await fetch("/api/heal", {method:"POST"});
+    const d = await r.json();
+    if (d.error) { $("heal-msg").className = "sub err"; $("heal-msg").textContent = d.error; return; }
+    const q = (d.quarantined || []).length;
+    $("heal-msg").className = "sub";
+    $("heal-msg").textContent = (d.ok ? "✅ arrancado. " : "⚠ no arrancó. ") +
+      (q ? q + " mod(s) en cuarentena: " + d.quarantined.join(", ") : "sin cambios") +
+      (d.hint ? " — " + d.hint : "");
+    loadMods();
+  } catch (e) { $("heal-msg").className = "sub err"; $("heal-msg").textContent = "fallo: " + e; }
+}
+
 async function power(action) {
   if (!confirm("¿Seguro que quieres " + action + " el servidor?")) return;
   log("[power] " + action + "…", "muted");
@@ -219,12 +312,16 @@ async function loadMods() {
       ul.innerHTML = '<li class="muted">Sin mods instalados</li>';
       return;
     }
-    ul.innerHTML = d.mods.map(m =>
-      '<li style="display:flex;justify-content:space-between;align-items:center">' +
-      '<span>' + m.name + ' <span class="muted">(' + m.size_kb + ' KB)</span></span>' +
-      '<button class="stop" onclick="deleteMod(\'' + m.name.replace(/'/g, "\\'") + '\')">Borrar</button>' +
-      '</li>'
-    ).join("");
+    ul.innerHTML = d.mods.map(m => {
+      const nm = m.name.replace(/'/g, "\\'");
+      const off = m.enabled ? "" : ";opacity:.45";
+      return '<li style="display:flex;justify-content:space-between;align-items:center' + off + '">' +
+      '<span>' + (m.enabled ? "" : "⛔ ") + m.name + ' <span class="muted">(' + m.size_kb + ' KB)</span></span>' +
+      '<span style="display:flex;gap:6px">' +
+      '<button onclick="toggleMod(\'' + nm + '\')">' + (m.enabled ? "Desactivar" : "Activar") + '</button>' +
+      '<button class="stop" onclick="deleteMod(\'' + nm + '\')">Borrar</button>' +
+      '</span></li>';
+    }).join("");
   } catch (e) { $("mod-list").innerHTML = '<li class="err">error al listar</li>'; }
 }
 
@@ -272,6 +369,13 @@ async function addModUrl() {
   loadMods();
 }
 
+async function toggleMod(name) {
+  const r = await fetch("/api/mods/" + encodeURIComponent(name) + "/toggle", {method:"POST"});
+  const d = await r.json();
+  log(d.error ? "[mod] " + d.error : "[mod] " + name + (d.enabled ? " activado" : " desactivado") + " (reinicia para aplicar)", d.error ? "err" : "muted");
+  loadMods();
+}
+
 async function deleteMod(name) {
   if (!confirm("¿Borrar mod " + name + "?")) return;
   const r = await fetch("/api/mods/" + encodeURIComponent(name), { method: "DELETE" });
@@ -280,9 +384,142 @@ async function deleteMod(name) {
   loadMods();
 }
 
+// ---- server.properties ----
+const PROP_LABELS = {
+  "level-seed":"Seed","level-name":"Nombre mundo","level-type":"Tipo mundo",
+  "difficulty":"Dificultad","gamemode":"Modo juego","motd":"MOTD",
+  "max-players":"Max jugadores","view-distance":"Distancia vista",
+  "simulation-distance":"Distancia simulacion","pvp":"PVP","hardcore":"Hardcore",
+  "white-list":"Whitelist","enforce-whitelist":"Forzar whitelist","online-mode":"Modo online",
+  "spawn-protection":"Proteccion spawn","allow-nether":"Permitir Nether",
+  "allow-flight":"Permitir vuelo","enable-command-block":"Command blocks",
+  "spawn-monsters":"Spawn monstruos","force-gamemode":"Forzar modo",
+};
+async function loadProps() {
+  try {
+    const r = await fetch("/api/properties");
+    const d = await r.json();
+    const g = $("props-grid"); g.innerHTML = "";
+    for (const [k, v] of Object.entries(d.editable)) {
+      const wrap = document.createElement("label");
+      wrap.style.cssText = "display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)";
+      wrap.innerHTML = "<span>" + (PROP_LABELS[k] || k) + "</span>";
+      const inp = document.createElement("input");
+      inp.dataset.key = k; inp.value = v;
+      inp.style.cssText = "background:#0a0c10;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:8px;font-size:13px";
+      wrap.appendChild(inp); g.appendChild(wrap);
+    }
+  } catch (e) {}
+}
+async function saveProps(restart) {
+  const props = {};
+  document.querySelectorAll("#props-grid input").forEach(i => props[i.dataset.key] = i.value);
+  $("props-msg").textContent = "guardando…";
+  const r = await fetch("/api/properties", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({properties: props, restart})
+  });
+  const d = await r.json();
+  $("props-msg").textContent = d.error ? d.error : (restart ? "guardado + reiniciando" : "guardado (reinicia para aplicar)");
+}
+
+// ---- backups ----
+async function loadBackups() {
+  try {
+    const r = await fetch("/api/backups");
+    const d = await r.json();
+    const ul = $("bk-list");
+    if (!d.backups.length) { ul.innerHTML = '<li class="muted">Sin backups</li>'; return; }
+    ul.innerHTML = d.backups.map(b =>
+      '<li style="display:flex;justify-content:space-between;align-items:center;gap:8px">' +
+      '<span>' + b.name + ' <span class="muted">(' + b.size_mb + ' MB · ' + b.date + ')</span></span>' +
+      '<span style="display:flex;gap:6px">' +
+      '<button onclick="location.href=\'/api/backups/' + encodeURIComponent(b.name) + '/download\'">⬇</button>' +
+      '<button onclick="restoreBackup(\'' + b.name.replace(/'/g,"\\'") + '\')">Restaurar</button>' +
+      '<button class="stop" onclick="delBackup(\'' + b.name.replace(/'/g,"\\'") + '\')">✕</button>' +
+      '</span></li>'
+    ).join("");
+  } catch (e) {}
+}
+async function createBackup() {
+  $("bk-msg").textContent = "creando backup…";
+  const r = await fetch("/api/backups", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({label: $("bk-label").value.trim()})
+  });
+  const d = await r.json();
+  $("bk-msg").textContent = d.error ? d.error : ("creado: " + d.name + " (" + d.size_mb + " MB)");
+  $("bk-label").value = ""; loadBackups();
+}
+async function delBackup(name) {
+  if (!confirm("¿Borrar backup " + name + "?")) return;
+  await fetch("/api/backups/" + encodeURIComponent(name), {method:"DELETE"});
+  loadBackups();
+}
+async function restoreBackup(name) {
+  if (!confirm("¿Restaurar " + name + "? Esto PARA el server, reemplaza el mundo actual y lo reinicia.")) return;
+  $("bk-msg").textContent = "restaurando… (el server se reinicia)";
+  const r = await fetch("/api/backups/" + encodeURIComponent(name) + "/restore", {method:"POST"});
+  const d = await r.json();
+  $("bk-msg").textContent = d.error ? d.error : ("restaurado: " + name);
+}
+
+// ---- regenerar mundo ----
+async function regenWorld() {
+  if (!confirm("¿Regenerar el mundo? Se hace backup del actual y se borra para crear uno nuevo.")) return;
+  $("seed-msg").textContent = "regenerando…";
+  const r = await fetch("/api/world/regenerate", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({seed: $("seed").value.trim(), level_type: $("leveltype").value})
+  });
+  const d = await r.json();
+  $("seed-msg").textContent = d.error ? d.error : ("mundo nuevo" + (d.seed ? " seed=" + d.seed : "") + " · reiniciando");
+  loadBackups();
+}
+
+// ---- jugadores ----
+function plCmd(action) {
+  const name = $("pl-name").value.trim();
+  if (!name) { $("pl-msg").textContent = "escribe un nombre"; return; }
+  rconTo(action + " " + name);
+}
+async function rconTo(cmd) {
+  const r = await fetch("/api/command", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({command: cmd})
+  });
+  const d = await r.json();
+  $("pl-msg").textContent = d.error ? d.error : (cmd + " → " + (d.output || "ok"));
+}
+
+// ---- scheduling ----
+async function loadSchedule() {
+  try {
+    const r = await fetch("/api/schedule");
+    const c = await r.json();
+    $("sc-bk").checked = c.backup_enabled; $("sc-bk-h").value = c.backup_interval_h;
+    $("sc-rs").checked = c.restart_enabled; $("sc-rs-h").value = c.restart_interval_h;
+  } catch (e) {}
+}
+async function saveSchedule() {
+  $("sc-msg").textContent = "guardando…";
+  const r = await fetch("/api/schedule", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({
+      backup_enabled: $("sc-bk").checked, backup_interval_h: +$("sc-bk-h").value,
+      restart_enabled: $("sc-rs").checked, restart_interval_h: +$("sc-rs-h").value
+    })
+  });
+  const c = await r.json();
+  $("sc-msg").textContent = "guardado";
+}
+
 $("cmd").addEventListener("keydown", e => { if (e.key === "Enter") send(); });
 poll();
 loadMods();
+loadProps();
+loadBackups();
+loadSchedule();
 setInterval(poll, 3000);
 </script>
 </body>
