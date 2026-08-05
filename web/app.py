@@ -204,6 +204,9 @@ def api_status():
         try:
             stats = cpu_mem_stats(c)
 
+            # --- FORZAR LÍMITE DE CPU DEL SERVIDOR MC A LOS NÚCLEOS CORRESPONDIENTES ---
+            stats["cpu_pct"] = round(stats["cpu_pct"] / 8.0, 1)
+
             # --- FORZAR LÍMITE DE RAM DEL SERVIDOR MC ---
             try:
                 with open("/data/user_jvm_args.txt", "r") as f:
