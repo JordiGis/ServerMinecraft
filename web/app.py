@@ -199,15 +199,41 @@ def api_status():
         "version": env.get("VERSION"),
         "port": env.get("SERVER_PORT", "25565"),
     }
+
     if c.status == "running":
         try:
-            out["stats"] = cpu_mem_stats(c)
+            stats = cpu_mem_stats(c)
+
+            # --- FORZAR LÍMITE DE RAM DEL SERVIDOR MC ---
+            try:
+                with open("/data/user_jvm_args.txt", "r") as f:
+                    # Busca el valor de -Xmx (ej: -Xmx8G)
+                    match = re.search(r'-Xmx(\d+)([GM])', f.read(), re.IGNORECASE)
+                    if match:
+                        val = int(match.group(1))
+                        # Convertir a Megabytes
+                        limit_mb = val * 1024 if match.group(2).upper() == 'G' else val
+
+                        stats["mem_limit_mb"] = float(limit_mb)
+                        # Recalcular el porcentaje con el nuevo límite
+                        pct = (stats["mem_used_mb"] / limit_mb) * 100
+                        # Evitar que muestre más del 100% por el overhead de Java
+                        stats["mem_pct"] = min(100.0, round(pct, 1))
+            except Exception:
+                pass # Si falla al leer el archivo, devuelve la memoria del VPS
+
+            out["stats"] = stats
+            # ---------------------------------------------
+
         except Exception as e:  # noqa: BLE001
             out["stats_error"] = str(e)
+
+        # Players
         try:
             out["players"] = parse_players(rcon_command("list"))
         except Exception as e:  # noqa: BLE001
             out["players_error"] = str(e)
+
     return jsonify(out)
 
 
